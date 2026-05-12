@@ -1,5 +1,18 @@
 # auth
 
+## 1.7.0-beta.4
+
+### Minor Changes
+
+- [#9547](https://github.com/better-auth/better-auth/pull/9547) [`15bb169`](https://github.com/better-auth/better-auth/commit/15bb1690b274b9f1e2a58c5db039bd240dc5e99b) Thanks [@GautamBytes](https://github.com/GautamBytes)! - Add a `create-admin` CLI command for creating an initial admin user through the configured Better Auth instance.
+
+### Patch Changes
+
+- Updated dependencies []:
+  - better-auth@1.7.0-beta.4
+  - @better-auth/core@1.7.0-beta.4
+  - @better-auth/telemetry@1.7.0-beta.4
+
 ## 1.7.0-beta.3
 
 ### Minor Changes
