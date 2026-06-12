@@ -84,6 +84,69 @@ describe("magic link", async () => {
 		expect(betterAuthCookie).toBeDefined();
 	});
 
+	it("should reject new-user magic link verify when validateUserInfo returns error", async () => {
+		let blockedEmail: VerificationEmail = {
+			email: "",
+			token: "",
+			url: "",
+		};
+		const { customFetchImpl } = await getTestInstance(
+			{
+				user: {
+					validateUserInfo({ source }) {
+						expect(source.method).toBe("magic-link");
+						return {
+							error: "magic_link_blocked",
+							errorDescription: "Magic link sign-up is not allowed",
+						};
+					},
+				},
+				plugins: [
+					magicLink({
+						async sendMagicLink(data) {
+							blockedEmail = data;
+						},
+					}),
+				],
+			},
+			{
+				clientOptions: {
+					plugins: [magicLinkClient()],
+				},
+				disableTestUser: true,
+			},
+		);
+		const blockedClient = createAuthClient({
+			plugins: [magicLinkClient()],
+			fetchOptions: {
+				customFetchImpl,
+			},
+			baseURL: "http://localhost:3000",
+			basePath: "/api/auth",
+		});
+
+		await blockedClient.signIn.magicLink({
+			email: "new-magic-link@example.com",
+		});
+		await blockedClient.magicLink.verify(
+			{
+				query: {
+					token: new URL(blockedEmail.url).searchParams.get("token") || "",
+				},
+			},
+			{
+				onError(context) {
+					expect(context.response.status).toBe(302);
+					const location = context.response.headers.get("location");
+					expect(location).toContain("error=magic_link_blocked");
+					expect(location).toContain(
+						"error_description=Magic+link+sign-up+is+not+allowed",
+					);
+				},
+			},
+		);
+	});
+
 	it("shouldn't verify magic link with the same token", async () => {
 		await client.magicLink.verify(
 			{
@@ -119,7 +182,7 @@ describe("magic link", async () => {
 				onError(context) {
 					expect(context.response.status).toBe(302);
 					const location = context.response.headers.get("location");
-					expect(location).toContain("?error=EXPIRED_TOKEN");
+					expect(location).toContain("?error=INVALID_TOKEN");
 				},
 			},
 		);
@@ -555,7 +618,7 @@ describe("magic link storeToken", async () => {
  * Magic-link tokens are consumed atomically on the first verification call that
  * finds the token: the row is deleted before any subsequent success checks
  * (signup gates, session creation, etc.), so even a verify that ends in
- * `EXPIRED_TOKEN`, `new_user_signup_disabled`, or `failed_to_create_session`
+ * `INVALID_TOKEN`, `new_user_signup_disabled`, or `failed_to_create_session`
  * still burns the token. `allowedAttempts` is retained on the options type for
  * backward compatibility but does not multiply redemptions; a token mints at
  * most one session regardless of the value.

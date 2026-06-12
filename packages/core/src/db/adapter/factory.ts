@@ -138,6 +138,11 @@ export const createAdapterFactory =
 							!config.debugLogs.consumeOne
 						) {
 							return;
+						} else if (
+							method === "incrementOne" &&
+							!config.debugLogs.incrementOne
+						) {
+							return;
 						} else if (method === "count" && !config.debugLogs.count) {
 							return;
 						}
@@ -491,6 +496,7 @@ export const createAdapterFactory =
 				| "delete"
 				| "deleteMany"
 				| "consumeOne"
+				| "incrementOne"
 				| "count";
 		}): W extends undefined ? undefined : CleanedWhere[] => {
 			if (!where) return undefined as any;
@@ -1057,6 +1063,14 @@ export const createAdapterFactory =
 							update: data,
 						}),
 				);
+				if (
+					typeof updatedCount !== "number" ||
+					!Number.isFinite(updatedCount)
+				) {
+					throw new BetterAuthError(
+						`Adapter "${config.adapterId}" updateMany must return a finite number affected row count.`,
+					);
+				}
 				debugLog(
 					{ method: "updateMany" },
 					`${formatTransactionId(thisTransactionId)} ${formatStep(3, 4)}`,
@@ -1341,61 +1355,19 @@ export const createAdapterFactory =
 					{ model, where },
 				);
 
-				let res: T | null;
-				let resultNeedsOutputTransform = true;
-				if (adapterInstance.consumeOne) {
-					res = await withSpan(
-						`db consumeOne ${model}`,
-						{
-							[ATTR_DB_OPERATION_NAME]: "consumeOne",
-							[ATTR_DB_COLLECTION_NAME]: model,
-						},
-						() => adapterInstance.consumeOne!<T>({ model, where }),
+				if (typeof adapterInstance.consumeOne !== "function") {
+					throw new BetterAuthError(
+						`Adapter "${config.adapterId}" must implement consumeOne for atomic single-use credential consumption.`,
 					);
-				} else {
-					// TODO(consume-one-required): adapters without native `consumeOne`
-					// fall back to `transaction(findMany + deleteMany)`. Race-safe on
-					// engines with real transaction isolation; race window narrows
-					// (does not close) on adapters that fall through to sequential
-					// execution. Remove this branch when consumeOne becomes required.
-					// FIXME(consume-one-nested-transaction): custom adapters without a
-					// native consumeOne have no portable signal for "already inside a
-					// transaction". First-party adapters mark transaction-scoped
-					// adapters as as-is; make that capability explicit in the next
-					// breaking adapter contract.
-					res = await withSpan(
-						`db consumeOne ${model}`,
-						{
-							[ATTR_DB_OPERATION_NAME]: "consumeOne",
-							[ATTR_DB_COLLECTION_NAME]: model,
-						},
-						() =>
-							adapter.transaction(async (trx) => {
-								const rows = await trx.findMany<Record<string, any>>({
-									model: unsafeModel,
-									where: unsafeWhere,
-									limit: 1,
-								});
-								const target = rows[0];
-								if (!target) return null;
-								const deleted = await trx.deleteMany({
-									model: unsafeModel,
-									where: [
-										...unsafeWhere,
-										{
-											field: "id",
-											value: target.id,
-											operator: "eq",
-											connector: "AND",
-											mode: "sensitive",
-										},
-									],
-								});
-								return deleted > 0 ? (target as T) : null;
-							}),
-					);
-					resultNeedsOutputTransform = false;
 				}
+				const res = await withSpan(
+					`db consumeOne ${model}`,
+					{
+						[ATTR_DB_OPERATION_NAME]: "consumeOne",
+						[ATTR_DB_COLLECTION_NAME]: model,
+					},
+					() => adapterInstance.consumeOne<T>({ model, where }),
+				);
 
 				debugLog(
 					{ method: "consumeOne" },
@@ -1404,11 +1376,7 @@ export const createAdapterFactory =
 					{ model, data: res },
 				);
 				let transformed: any = res;
-				if (
-					!config.disableTransformOutput &&
-					resultNeedsOutputTransform &&
-					res
-				) {
+				if (!config.disableTransformOutput && res) {
 					transformed = await transformOutput(
 						res as Record<string, any>,
 						unsafeModel,
@@ -1420,6 +1388,89 @@ export const createAdapterFactory =
 					{ method: "consumeOne" },
 					`${formatTransactionId(thisTransactionId)} ${formatStep(3, 3)}`,
 					`${formatMethod("consumeOne")} ${formatAction("Parsed Result")}:`,
+					{ model, data: transformed },
+				);
+				return transformed as T | null;
+			},
+			incrementOne: async <T>({
+				model: unsafeModel,
+				where: unsafeWhere,
+				increment: unsafeIncrement,
+				set: unsafeSet,
+			}: {
+				model: string;
+				where: Where[];
+				increment: Record<string, number>;
+				set?: Record<string, unknown> | undefined;
+			}): Promise<T | null> => {
+				transactionId++;
+				const thisTransactionId = transactionId;
+				const model = getModelName(unsafeModel);
+				const where = transformWhereClause({
+					model: unsafeModel,
+					where: unsafeWhere,
+					action: "incrementOne",
+				});
+				unsafeModel = getDefaultModelName(unsafeModel);
+				debugLog(
+					{ method: "incrementOne" },
+					`${formatTransactionId(thisTransactionId)} ${formatStep(1, 3)}`,
+					`${formatMethod("incrementOne")} ${formatAction("IncrementOne")}:`,
+					{ model, where, increment: unsafeIncrement, set: unsafeSet },
+				);
+
+				if (typeof adapterInstance.incrementOne !== "function") {
+					throw new BetterAuthError(
+						`Adapter "${config.adapterId}" must implement incrementOne for atomic guarded counter updates.`,
+					);
+				}
+				const mappedKeys = config.mapKeysTransformInput ?? {};
+				const increment: Record<string, number> = {};
+				for (const [field, delta] of Object.entries(unsafeIncrement)) {
+					increment[
+						mappedKeys[field] || getFieldName({ model: unsafeModel, field })
+					] = delta;
+				}
+				let set: Record<string, unknown> | undefined;
+				if (unsafeSet && !config.disableTransformInput) {
+					set = await transformInput(unsafeSet, unsafeModel, "update");
+				} else {
+					set = unsafeSet;
+				}
+				const res = await withSpan(
+					`db incrementOne ${model}`,
+					{
+						[ATTR_DB_OPERATION_NAME]: "incrementOne",
+						[ATTR_DB_COLLECTION_NAME]: model,
+					},
+					() =>
+						adapterInstance.incrementOne<T>({
+							model,
+							where,
+							increment,
+							set,
+						}),
+				);
+
+				debugLog(
+					{ method: "incrementOne" },
+					`${formatTransactionId(thisTransactionId)} ${formatStep(2, 3)}`,
+					`${formatMethod("incrementOne")} ${formatAction("DB Result")}:`,
+					{ model, data: res },
+				);
+				let transformed: any = res;
+				if (!config.disableTransformOutput && res) {
+					transformed = await transformOutput(
+						res as Record<string, any>,
+						unsafeModel,
+						undefined,
+						undefined,
+					);
+				}
+				debugLog(
+					{ method: "incrementOne" },
+					`${formatTransactionId(thisTransactionId)} ${formatStep(3, 3)}`,
+					`${formatMethod("incrementOne")} ${formatAction("Parsed Result")}:`,
 					{ model, data: transformed },
 				);
 				return transformed as T | null;

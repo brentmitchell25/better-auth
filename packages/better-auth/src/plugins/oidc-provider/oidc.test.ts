@@ -15,7 +15,6 @@ import { createAuthClient } from "../../client";
 import { toNodeHandler } from "../../integrations/node";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { genericOAuth } from "../generic-oauth";
-import { genericOAuthClient } from "../generic-oauth/client";
 import { jwt } from "../jwt";
 import { oidcProvider } from ".";
 import type { OidcClientPlugin } from "./client";
@@ -154,7 +153,7 @@ describe("oidc", async () => {
 	let application: Client = {
 		clientId: "test-client-id",
 		clientSecret: "test-client-secret-oidc",
-		redirectUrls: ["http://localhost:3000/api/auth/oauth2/callback/test"],
+		redirectUrls: ["http://localhost:3000/api/auth/callback/test"],
 		metadata: {},
 		type: "web",
 		disabled: false,
@@ -171,7 +170,7 @@ describe("oidc", async () => {
 			client_id: expect.any(String),
 			client_secret: expect.any(String),
 			client_name: "test",
-			redirect_uris: ["http://localhost:3000/api/auth/oauth2/callback/test"],
+			redirect_uris: ["http://localhost:3000/api/auth/callback/test"],
 			grant_types: ["authorization_code"],
 			response_types: ["code"],
 			token_endpoint_auth_method: "client_secret_basic",
@@ -232,16 +231,15 @@ describe("oidc", async () => {
 			});
 
 		const client = createAuthClient({
-			plugins: [genericOAuthClient()],
 			baseURL: "http://localhost:5000",
 			fetchOptions: {
 				customFetchImpl: customFetchImplRP,
 			},
 		});
 		const oAuthHeaders = new Headers();
-		const data = await client.signIn.oauth2(
+		const data = await client.signIn.social(
 			{
-				providerId: "test",
+				provider: "test",
 				callbackURL: "/dashboard",
 			},
 			{
@@ -257,7 +255,7 @@ describe("oidc", async () => {
 		// Make the authorization request
 		let redirectURI = "";
 		const consentHeaders = new Headers();
-		await serverClient.$fetch(data.url, {
+		await serverClient.$fetch(data.url!, {
 			method: "GET",
 			onError(context) {
 				redirectURI = context.response.headers.get("Location") || "";
@@ -276,7 +274,7 @@ describe("oidc", async () => {
 
 		// Verify we got an authorization code
 		expect(redirectURI).toContain(
-			"http://localhost:3000/api/auth/oauth2/callback/test?code=",
+			"http://localhost:3000/api/auth/callback/test?code=",
 		);
 
 		// Complete the OAuth flow
@@ -320,16 +318,15 @@ describe("oidc", async () => {
 			});
 
 		const client = createAuthClient({
-			plugins: [genericOAuthClient()],
 			baseURL: "http://localhost:5000",
 			fetchOptions: {
 				customFetchImpl: customFetchImplRP,
 			},
 		});
 		const oAuthHeaders = new Headers();
-		const data = await client.signIn.oauth2(
+		const data = await client.signIn.social(
 			{
-				providerId: "test",
+				provider: "test",
 				callbackURL: "/dashboard",
 			},
 			{
@@ -344,7 +341,7 @@ describe("oidc", async () => {
 
 		let redirectURI = "";
 		const newHeaders = new Headers();
-		await serverClient.$fetch(data.url, {
+		await serverClient.$fetch(data.url!, {
 			method: "GET",
 			onError(context) {
 				redirectURI = context.response.headers.get("Location") || "";
@@ -367,7 +364,7 @@ describe("oidc", async () => {
 			},
 		);
 		expect(res.redirectURI).toContain(
-			"http://localhost:3000/api/auth/oauth2/callback/test?code=",
+			"http://localhost:3000/api/auth/callback/test?code=",
 		);
 
 		let callbackURL = "";
@@ -410,16 +407,15 @@ describe("oidc", async () => {
 			});
 
 		const client = createAuthClient({
-			plugins: [genericOAuthClient()],
 			baseURL: "http://localhost:5000",
 			fetchOptions: {
 				customFetchImpl: customFetchImplRP,
 			},
 		});
 		const oAuthHeaders = new Headers();
-		const data = await client.signIn.oauth2(
+		const data = await client.signIn.social(
 			{
-				providerId: "test",
+				provider: "test",
 				callbackURL: "/dashboard",
 			},
 			{
@@ -434,7 +430,7 @@ describe("oidc", async () => {
 
 		let redirectURI = "";
 		const newHeaders = new Headers();
-		await serverClient.$fetch(data.url, {
+		await serverClient.$fetch(data.url!, {
 			method: "GET",
 			onError(context) {
 				redirectURI = context.response.headers.get("Location") || "";
@@ -459,7 +455,7 @@ describe("oidc", async () => {
 		);
 
 		expect(redirectURI).toContain(
-			"http://localhost:3000/api/auth/oauth2/callback/test?code=",
+			"http://localhost:3000/api/auth/callback/test?code=",
 		);
 		let callbackURL = "";
 		await client.$fetch(redirectURI, {
@@ -479,7 +475,7 @@ describe("oidc", async () => {
 			const testClient = await serverClient.oauth2.register({
 				client_name: "test-login-required-prompt-none",
 				redirect_uris: [
-					"http://localhost:3000/api/auth/oauth2/callback/login-required",
+					"http://localhost:3000/api/auth/callback/login-required",
 				],
 			});
 			const clientId = testClient.data?.client_id ?? "";
@@ -567,7 +563,7 @@ describe("oidc", async () => {
 			// Create a new OAuth application that requires consent
 			const newClient = await serverClient.oauth2.register({
 				client_name: "test-consent-required",
-				redirect_uris: ["http://localhost:3000/api/auth/oauth2/callback/test2"],
+				redirect_uris: ["http://localhost:3000/api/auth/callback/test2"],
 			});
 
 			// Create a fresh user session that hasn't consented to this new client yet
@@ -610,9 +606,7 @@ describe("oidc", async () => {
 			// Create a new client for this test
 			const testClient = await serverClient.oauth2.register({
 				client_name: "test-prompt-none-success",
-				redirect_uris: [
-					"http://localhost:3000/api/auth/oauth2/callback/test-none",
-				],
+				redirect_uris: ["http://localhost:3000/api/auth/callback/test-none"],
 			});
 
 			// First, establish consent by doing a normal authorization flow
@@ -686,7 +680,7 @@ describe("oidc", async () => {
 			const loginConsentClient = await serverClient.oauth2.register({
 				client_name: "test-login-consent",
 				redirect_uris: [
-					"http://localhost:3000/api/auth/oauth2/callback/login-consent",
+					"http://localhost:3000/api/auth/callback/login-consent",
 				],
 			});
 
@@ -857,9 +851,7 @@ describe("oidc", async () => {
 			// Step 1: Create a new OAuth client for this test
 			const testClient = await serverClient.oauth2.register({
 				client_name: "test-cookie-persistence",
-				redirect_uris: [
-					"http://localhost:3000/api/auth/oauth2/callback/test-persist",
-				],
+				redirect_uris: ["http://localhost:3000/api/auth/callback/test-persist"],
 			});
 
 			// Step 2: Logout to start fresh
@@ -956,7 +948,7 @@ describe("oidc", async () => {
 				}
 			});
 
-			expect(normalLoginRedirect).not.toContain("oauth2/callback");
+			expect(normalLoginRedirect).not.toContain("/callback/");
 			expect(normalLoginRedirect).not.toContain(
 				testClient.data?.redirect_uris[0] || "",
 			);
@@ -980,6 +972,7 @@ describe("oidc", async () => {
 		it("should logout successfully without parameters", async ({ expect }) => {
 			const response = await serverClient.$fetch("/oauth2/endsession", {
 				method: "GET",
+				headers: { "Sec-Fetch-Site": "same-origin" },
 			});
 			expect(response.data).toMatchObject({
 				success: true,
@@ -995,6 +988,7 @@ describe("oidc", async () => {
 				`/oauth2/endsession?client_id=${application.clientId}&post_logout_redirect_uri=${encodeURIComponent(application.redirectUrls[0]!)}&state=test-state`,
 				{
 					method: "GET",
+					headers: { "Sec-Fetch-Site": "same-origin" },
 					onError(context) {
 						redirectLocation = context.response.headers.get("Location") || "";
 					},
@@ -1050,6 +1044,7 @@ describe("oidc", async () => {
 		it("should support POST method", async ({ expect }) => {
 			const response = await serverClient.$fetch("/oauth2/endsession", {
 				method: "POST",
+				headers: { "Sec-Fetch-Site": "same-origin" },
 			});
 			expect(response.data).toMatchObject({
 				success: true,
@@ -1118,7 +1113,7 @@ describe("oidc storage", async () => {
 		let application: Client = {
 			clientId: "test-client-id",
 			clientSecret: "test-client-secret-oidc",
-			redirectUrls: ["http://localhost:3000/api/auth/oauth2/callback/test"],
+			redirectUrls: ["http://localhost:3000/api/auth/callback/test"],
 			metadata: {},
 			icon: "",
 			type: "web",
@@ -1135,7 +1130,7 @@ describe("oidc storage", async () => {
 			client_secret: expect.any(String),
 			client_name: "test",
 			logo_uri: "",
-			redirect_uris: ["http://localhost:3000/api/auth/oauth2/callback/test"],
+			redirect_uris: ["http://localhost:3000/api/auth/callback/test"],
 			grant_types: ["authorization_code"],
 			response_types: ["code"],
 			token_endpoint_auth_method: "client_secret_basic",
@@ -1182,16 +1177,15 @@ describe("oidc storage", async () => {
 			});
 
 		const client = createAuthClient({
-			plugins: [genericOAuthClient()],
 			baseURL: "http://localhost:5000",
 			fetchOptions: {
 				customFetchImpl: customFetchImplRP,
 			},
 		});
 		const oAuthHeaders = new Headers();
-		const data = await client.signIn.oauth2(
+		const data = await client.signIn.social(
 			{
-				providerId: "test",
+				provider: "test",
 				callbackURL: "/dashboard",
 			},
 			{
@@ -1206,7 +1200,7 @@ describe("oidc storage", async () => {
 
 		let redirectURI = "";
 		const newHeaders = new Headers();
-		await serverClient.$fetch(data.url, {
+		await serverClient.$fetch(data.url!, {
 			method: "GET",
 			onError(context) {
 				redirectURI = context.response.headers.get("Location") || "";
@@ -1226,7 +1220,7 @@ describe("oidc storage", async () => {
 
 		// Verify we got an authorization code
 		expect(redirectURI).toContain(
-			"http://localhost:3000/api/auth/oauth2/callback/test?code=",
+			"http://localhost:3000/api/auth/callback/test?code=",
 		);
 
 		let callbackURL = "";
@@ -1273,7 +1267,7 @@ describe("oidc token response format", async () => {
 
 		const createdClient = await serverClient.oauth2.register({
 			client_name: "test-app",
-			redirect_uris: ["http://localhost:3000/api/auth/oauth2/callback/test"],
+			redirect_uris: ["http://localhost:3000/api/auth/callback/test"],
 			logo_uri: "",
 		});
 
@@ -1304,16 +1298,15 @@ describe("oidc token response format", async () => {
 			});
 
 		const client = createAuthClient({
-			plugins: [genericOAuthClient()],
 			baseURL: "http://localhost:5000",
 			fetchOptions: {
 				customFetchImpl: customFetchImplRP,
 			},
 		});
 		const oAuthHeaders = new Headers();
-		const data = await client.signIn.oauth2(
+		const data = await client.signIn.social(
 			{
-				providerId: "test",
+				provider: "test",
 				callbackURL: "/dashboard",
 			},
 			{
@@ -1324,7 +1317,7 @@ describe("oidc token response format", async () => {
 
 		let redirectURI = "";
 		const consentHeaders = new Headers();
-		await serverClient.$fetch(data.url, {
+		await serverClient.$fetch(data.url!, {
 			method: "GET",
 			onError(context) {
 				redirectURI = context.response.headers.get("Location") || "";
@@ -1366,7 +1359,7 @@ describe("oidc token response format", async () => {
 				body: JSON.stringify({
 					grant_type: "authorization_code",
 					code,
-					redirect_uri: "http://localhost:3000/api/auth/oauth2/callback/test",
+					redirect_uri: "http://localhost:3000/api/auth/callback/test",
 					client_id: application.clientId,
 					client_secret: application.clientSecret,
 				}),
@@ -1405,7 +1398,7 @@ describe("oidc token response format", async () => {
 				body: JSON.stringify({
 					grant_type: "authorization_code",
 					code,
-					redirect_uri: "http://localhost:3000/api/auth/oauth2/callback/test",
+					redirect_uri: "http://localhost:3000/api/auth/callback/test",
 					client_id: application.clientId,
 					client_secret: application.clientSecret,
 				}),
@@ -1462,7 +1455,7 @@ describe("oidc token response format", async () => {
 				body: JSON.stringify({
 					grant_type: "authorization_code",
 					code,
-					redirect_uri: "http://localhost:3000/api/auth/oauth2/callback/test",
+					redirect_uri: "http://localhost:3000/api/auth/callback/test",
 					client_id: application.clientId,
 					client_secret: application.clientSecret,
 				}),
@@ -1545,7 +1538,7 @@ describe("oidc-jwt", async () => {
 		let application: Client = {
 			clientId: "test-client-id",
 			clientSecret: "test-client-secret-oidc",
-			redirectUrls: ["http://localhost:3000/api/auth/oauth2/callback/test"],
+			redirectUrls: ["http://localhost:3000/api/auth/callback/test"],
 			metadata: {},
 			icon: "",
 			type: "web",
@@ -1562,7 +1555,7 @@ describe("oidc-jwt", async () => {
 			client_secret: expect.any(String),
 			client_name: "test",
 			logo_uri: "",
-			redirect_uris: ["http://localhost:3000/api/auth/oauth2/callback/test"],
+			redirect_uris: ["http://localhost:3000/api/auth/callback/test"],
 			grant_types: ["authorization_code"],
 			response_types: ["code"],
 			token_endpoint_auth_method: "client_secret_basic",
@@ -1610,16 +1603,15 @@ describe("oidc-jwt", async () => {
 			});
 
 		const client = createAuthClient({
-			plugins: [genericOAuthClient()],
 			baseURL: "http://localhost:5000",
 			fetchOptions: {
 				customFetchImpl: customFetchImplRP,
 			},
 		});
 		const oAuthHeaders = new Headers();
-		const data = await client.signIn.oauth2(
+		const data = await client.signIn.social(
 			{
-				providerId: "test",
+				provider: "test",
 				callbackURL: "/dashboard",
 			},
 			{
@@ -1634,7 +1626,7 @@ describe("oidc-jwt", async () => {
 
 		let redirectURI = "";
 		const newHeaders = new Headers();
-		await serverClient.$fetch(data.url, {
+		await serverClient.$fetch(data.url!, {
 			method: "GET",
 			onError(context) {
 				redirectURI = context.response.headers.get("Location") || "";
@@ -1667,13 +1659,13 @@ describe("oidc-jwt", async () => {
 				},
 			);
 			expect(res.redirectURI).toContain(
-				"http://localhost:3000/api/auth/oauth2/callback/test?code=",
+				"http://localhost:3000/api/auth/callback/test?code=",
 			);
 			redirectURI = res.redirectURI;
 		} else {
 			// Direct code response (trusted client)
 			expect(redirectURI).toContain(
-				"http://localhost:3000/api/auth/oauth2/callback/test?code=",
+				"http://localhost:3000/api/auth/callback/test?code=",
 			);
 		}
 		let authToken = undefined;
@@ -2186,5 +2178,80 @@ describe("oidc-provider discovery metadata and PKCE gate (security)", () => {
 			codeChallengeMethod?: string;
 		};
 		expect(storedValue.codeChallengeMethod).toBe("plain");
+	});
+});
+
+describe("oidc end session cross-site protection (security)", async () => {
+	const { auth, signInWithTestUser, db } = await getTestInstance({
+		baseURL: "http://localhost:3000",
+		plugins: [oidcProvider({ loginPage: "/login" })],
+	});
+	const { user, headers } = await signInWithTestUser();
+	const cookie = headers.get("cookie") ?? "";
+
+	async function seedAccessToken() {
+		await db.create({
+			model: "oauthApplication",
+			data: {
+				clientId: "endsession-csrf-client",
+				clientSecret: "endsession-csrf-secret",
+				type: "web",
+				name: "Endsession CSRF Client",
+				redirectUrls: "http://localhost/callback",
+				disabled: false,
+				metadata: null,
+				icon: null,
+				userId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		await db.create({
+			model: "oauthAccessToken",
+			data: {
+				accessToken: "endsession-csrf-access",
+				refreshToken: "endsession-csrf-refresh",
+				accessTokenExpiresAt: new Date(Date.now() + 3600 * 1000),
+				refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+				clientId: "endsession-csrf-client",
+				userId: user.id,
+				scopes: "openid",
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+	}
+
+	it("rejects a cross-site GET logout carrying only a session cookie", async () => {
+		await seedAccessToken();
+
+		const response = await auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/endsession", {
+				method: "GET",
+				headers: { cookie, "Sec-Fetch-Site": "cross-site" },
+			}),
+		);
+		expect(response.status).toBe(403);
+
+		// A blocked logout must leave the session and OAuth tokens intact.
+		const session = await auth.api.getSession({
+			headers: new Headers({ cookie }),
+		});
+		expect(session?.user.id).toBe(user.id);
+		const tokenRow = await db.findOne({
+			model: "oauthAccessToken",
+			where: [{ field: "accessToken", value: "endsession-csrf-access" }],
+		});
+		expect(tokenRow).not.toBeNull();
+	});
+
+	it("allows a same-site cookie-only logout", async () => {
+		const response = await auth.handler(
+			new Request("http://localhost:3000/api/auth/oauth2/endsession", {
+				method: "GET",
+				headers: { cookie, "Sec-Fetch-Site": "same-origin" },
+			}),
+		);
+		expect(response.status).toBe(200);
 	});
 });

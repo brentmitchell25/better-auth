@@ -91,6 +91,13 @@ export type UsernameOptions = {
 				displayUsername?: "pre-normalization" | "post-normalization";
 		  }
 		| undefined;
+	/**
+	 * Whether the username should be immutable
+	 * When enabled, users cannot update their username after it has been set
+	 *
+	 * @default false
+	 */
+	immutableUsername?: boolean | undefined;
 };
 
 function defaultUsernameValidator(username: string) {
@@ -379,7 +386,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 				},
 				async (ctx) => {
 					if (!ctx.body.username || !ctx.body.password) {
-						ctx.context.logger.error("Username or password not found");
+						ctx.context.logger.warn("Username or password not found");
 						throw APIError.from(
 							"UNAUTHORIZED",
 							ERROR_CODES.INVALID_USERNAME_OR_PASSWORD,
@@ -395,9 +402,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 					const maxUsernameLength = options?.maxUsernameLength || 30;
 
 					if (username.length < minUsernameLength) {
-						ctx.context.logger.error("Username too short", {
-							username,
-						});
+						ctx.context.logger.warn("Username too short");
 						throw APIError.from(
 							"UNPROCESSABLE_ENTITY",
 							ERROR_CODES.USERNAME_TOO_SHORT,
@@ -405,9 +410,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 					}
 
 					if (username.length > maxUsernameLength) {
-						ctx.context.logger.error("Username too long", {
-							username,
-						});
+						ctx.context.logger.warn("Username too long");
 						throw APIError.from(
 							"UNPROCESSABLE_ENTITY",
 							ERROR_CODES.USERNAME_TOO_LONG,
@@ -440,9 +443,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 						// Hash password to prevent timing attacks from revealing valid usernames
 						// By hashing passwords for invalid usernames, we ensure consistent response times
 						await ctx.context.password.hash(ctx.body.password);
-						ctx.context.logger.error("User not found", {
-							username,
-						});
+						ctx.context.logger.warn("User not found");
 						throw APIError.from(
 							"UNAUTHORIZED",
 							ERROR_CODES.INVALID_USERNAME_OR_PASSWORD,
@@ -470,9 +471,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 					}
 					const currentPassword = account?.password;
 					if (!currentPassword) {
-						ctx.context.logger.error("Password not found", {
-							username,
-						});
+						ctx.context.logger.warn("Password not found");
 						throw APIError.from(
 							"UNAUTHORIZED",
 							ERROR_CODES.INVALID_USERNAME_OR_PASSWORD,
@@ -483,7 +482,7 @@ export const username = (options?: UsernameOptions | undefined) => {
 						password: ctx.body.password,
 					});
 					if (!validPassword) {
-						ctx.context.logger.error("Invalid password");
+						ctx.context.logger.warn("Invalid password");
 						throw APIError.from(
 							"UNAUTHORIZED",
 							ERROR_CODES.INVALID_USERNAME_OR_PASSWORD,
@@ -507,9 +506,9 @@ export const username = (options?: UsernameOptions | undefined) => {
 								undefined,
 								ctx.context.options.emailVerification?.expiresIn,
 							);
-							const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${
-								ctx.body.callbackURL || "/"
-							}`;
+							const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(
+								ctx.body.callbackURL || "/",
+							)}`;
 							await ctx.context.runInBackgroundOrAwait(
 								ctx.context.options.emailVerification.sendVerificationEmail(
 									{
@@ -664,6 +663,23 @@ export const username = (options?: UsernameOptions | undefined) => {
 								);
 							}
 							const normalizedUsername = normalizer(ctx.body.username);
+							const session =
+								ctx.path === "/update-user"
+									? await getSessionFromCtx(ctx)
+									: null;
+
+							if (ctx.path === "/update-user" && options?.immutableUsername) {
+								const hasUsername = !!session?.user.username;
+								const usernamesDiffer =
+									session?.user.username !== normalizedUsername;
+								if (hasUsername && usernamesDiffer) {
+									throw APIError.from(
+										"BAD_REQUEST",
+										ERROR_CODES.USERNAME_IS_IMMUTABLE,
+									);
+								}
+							}
+
 							const existingUser = await ctx.context.adapter.findOne<User>({
 								model: "user",
 								where: [
@@ -682,7 +698,6 @@ export const username = (options?: UsernameOptions | undefined) => {
 							}
 
 							if (ctx.path === "/update-user" && existingUser) {
-								const session = await getSessionFromCtx(ctx);
 								if (!session || existingUser.id !== session.user.id) {
 									throw APIError.from(
 										"BAD_REQUEST",

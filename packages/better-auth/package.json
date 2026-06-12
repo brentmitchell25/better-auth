@@ -1,6 +1,6 @@
 {
   "name": "better-auth",
-  "version": "1.6.11",
+  "version": "1.7.0-beta.5",
   "description": "The most comprehensive authentication framework for TypeScript.",
   "type": "module",
   "license": "MIT",
@@ -310,16 +310,6 @@
       "dev-source": "./src/plugins/device-authorization/index.ts",
       "types": "./dist/plugins/device-authorization/index.d.mts",
       "default": "./dist/plugins/device-authorization/index.mjs"
-    },
-    "./plugins/mcp/client": {
-      "dev-source": "./src/plugins/mcp/client/index.ts",
-      "types": "./dist/plugins/mcp/client/index.d.mts",
-      "default": "./dist/plugins/mcp/client/index.mjs"
-    },
-    "./plugins/mcp/client/adapters": {
-      "dev-source": "./src/plugins/mcp/client/adapters.ts",
-      "types": "./dist/plugins/mcp/client/adapters.d.mts",
-      "default": "./dist/plugins/mcp/client/adapters.mjs"
     }
   },
   "typesVersions": {
@@ -479,12 +469,6 @@
       ],
       "plugins/device-authorization": [
         "./dist/plugins/device-authorization/index.d.mts"
-      ],
-      "plugins/mcp/client": [
-        "./dist/plugins/mcp/client/index.d.mts"
-      ],
-      "plugins/mcp/client/adapters": [
-        "./dist/plugins/mcp/client/adapters.d.mts"
       ]
     }
   },
@@ -509,9 +493,9 @@
   },
   "devDependencies": {
     "@lynx-js/react": "^0.116.3",
-    "@sveltejs/kit": "^2.57.1",
-    "@tanstack/react-start": "^1.163.2",
-    "@tanstack/solid-start": "^1.163.2",
+    "@sveltejs/kit": "^2.60.1",
+    "@tanstack/react-start": "^1.168.4",
+    "@tanstack/solid-start": "^1.168.4",
     "@types/bun": "^1.3.9",
     "@types/google.accounts": "^0.0.18",
     "@types/pg": "^8.16.0",
@@ -530,7 +514,7 @@
     "tsdown": "catalog:",
     "type-fest": "^5.4.4",
     "typescript": "catalog:",
-    "vitest": "catalog:vitest",
+    "vitest": "^4.0.18",
     "vue": "^3.5.29"
   },
   "peerDependencies": {

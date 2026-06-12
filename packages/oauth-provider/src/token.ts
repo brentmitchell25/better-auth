@@ -2,10 +2,12 @@ import type { GenericEndpointContext } from "@better-auth/core";
 import { APIError } from "better-auth/api";
 import { generateRandomString } from "better-auth/crypto";
 import { generateCodeChallenge } from "better-auth/oauth2";
-import { signJWT, toExpJWT } from "better-auth/plugins";
+import { resolveSigningKey, signJWT, toExpJWT } from "better-auth/plugins";
 import type { Session, User } from "better-auth/types";
 import type { JWTPayload } from "jose";
-import { SignJWT } from "jose";
+import { base64url, decodeProtectedHeader, SignJWT } from "jose";
+import type { ResolvedResourcePolicy } from "./resources";
+import { resolveResourcePolicy, stripReservedClaims } from "./resources";
 import type {
 	OAuthOptions,
 	OAuthRefreshToken,
@@ -17,8 +19,10 @@ import type { GrantType } from "./types/oauth";
 import { verificationValueSchema } from "./types/zod";
 import { userNormalClaims } from "./userinfo";
 import {
-	basicToClientCredentials,
+	clientAllowsGrant,
 	decryptStoredClientSecret,
+	destructureCredentials,
+	extractClientCredentials,
 	getJwtPlugin,
 	getStoredToken,
 	isPKCERequired,
@@ -27,8 +31,12 @@ import {
 	resolveSessionAuthTime,
 	resolveSubjectIdentifier,
 	storeToken,
+	toAudienceClaim,
+	toResourceList,
 	validateClientCredentials,
 } from "./utils";
+
+const JWT_ACCESS_TOKEN_TYPE = "at+jwt";
 
 /**
  * Handles the /oauth2/token endpoint by delegating
@@ -38,9 +46,9 @@ export async function tokenEndpoint(
 	ctx: GenericEndpointContext,
 	opts: OAuthOptions<Scope[]>,
 ) {
-	const grantType: GrantType | undefined = ctx.body?.grant_type;
+	const grantType: GrantType = ctx.body.grant_type;
 
-	if (opts.grantTypes && grantType && !opts.grantTypes.includes(grantType)) {
+	if (opts.grantTypes && !opts.grantTypes.includes(grantType)) {
 		throw new APIError("BAD_REQUEST", {
 			error_description: `unsupported grant_type ${grantType}`,
 			error: "unsupported_grant_type",
@@ -54,16 +62,6 @@ export async function tokenEndpoint(
 			return handleClientCredentialsGrant(ctx, opts);
 		case "refresh_token":
 			return handleRefreshTokenGrant(ctx, opts);
-		case undefined:
-			throw new APIError("BAD_REQUEST", {
-				error_description: "missing required grant_type",
-				error: "unsupported_grant_type",
-			});
-		default:
-			throw new APIError("BAD_REQUEST", {
-				error_description: `unsupported grant_type ${grantType}`,
-				error: "unsupported_grant_type",
-			});
 	}
 }
 
@@ -74,49 +72,104 @@ async function createJwtAccessToken(
 	opts: OAuthOptions<Scope[]>,
 	user: User | undefined,
 	client: SchemaClient<Scope[]>,
-	audience: string | string[],
+	audienceClaim: string | string[],
 	scopes: string[],
+	resources?: string[],
 	referenceId?: string,
 	overrides?: {
 		iat?: number;
 		exp?: number;
 		sid?: string;
+		/**
+		 * Per-resource signing config resolved by {@link resolveResourcePolicy}.
+		 * `null` falls back to the JWT plugin's primary key.
+		 */
+		signingAlgorithm?: ResolvedResourcePolicy["signingAlgorithm"];
+		signingKeyId?: ResolvedResourcePolicy["signingKeyId"];
+		/** Per-resource custom claims (already reserved-claim-stripped). */
+		resourceCustomClaims?: Record<string, unknown>;
 	},
 ) {
 	const iat = overrides?.iat ?? Math.floor(Date.now() / 1000);
 	const exp = overrides?.exp ?? iat + (opts.accessTokenExpiresIn ?? 3600);
-	const customClaims = opts.customAccessTokenClaims
+	const pluginCustomClaims = opts.customAccessTokenClaims
 		? await opts.customAccessTokenClaims({
 				user,
 				scopes,
-				resource: ctx.body.resource,
+				resources,
 				referenceId,
 				metadata: parseClientMetadata(client.metadata),
 			})
 		: {};
 
-	const jwtPluginOptions = getJwtPlugin(ctx.context).options;
+	// Reserved-claim stripping is server-enforced for BOTH the resource-level
+	// customClaims (already stripped during policy resolution) AND the legacy
+	// plugin-level `customAccessTokenClaims` callback. The AS owns RFC 9068
+	// reserved names regardless of which extension surface tries to set them.
+	const safePluginClaims = stripReservedClaims(pluginCustomClaims);
+	const safeResourceClaims = overrides?.resourceCustomClaims ?? {};
 
-	// Sign token
+	const jwtPluginOptions = getJwtPlugin(ctx.context).options;
+	const subject = user?.id ?? client.clientId;
+
+	// Sign token — pass per-resource signing config if set; otherwise fall
+	// back to the JWT plugin's default.
 	return signJWT(ctx, {
 		options: jwtPluginOptions,
+		header: { typ: JWT_ACCESS_TOKEN_TYPE },
+		signingKeyId: overrides?.signingKeyId ?? undefined,
+		signingAlgorithm: overrides?.signingAlgorithm ?? undefined,
 		payload: {
-			...customClaims,
-			sub: user?.id,
-			aud:
-				typeof audience === "string"
-					? audience
-					: audience?.length === 1
-						? audience.at(0)
-						: audience,
+			...safePluginClaims,
+			...safeResourceClaims,
+			// RFC 9068 §2.2 requires `sub` on every JWT access token. For
+			// client_credentials, no resource owner participates, so the client is
+			// the subject represented to the resource server.
+			sub: subject,
+			aud: toAudienceClaim(audienceClaim),
+			// RFC 9068 §2.2.3: `client_id` MUST be present in JWT access tokens.
+			// Distinct from `azp` (authorized party — OIDC), kept for back-compat
+			// with introspection flows that key on it. The AS owns this value;
+			// `stripReservedClaims` removes any `client_id` from custom claims so
+			// resource/plugin extensions can't override it.
+			client_id: client.clientId,
 			azp: client.clientId,
 			scope: scopes.join(" "),
 			sid: overrides?.sid,
 			iss: jwtPluginOptions?.jwt?.issuer ?? ctx.context.baseURL,
 			iat,
 			exp,
+			// RFC 9068 §2.2.4: `jti` SHOULD be present. Emit a 128-bit random ID
+			// so audit trails and (future) revocation lookups can reference
+			// individual tokens.
+			jti: generateRandomString(32),
 		},
 	});
+}
+
+/**
+ * Computes an OIDC hash (at_hash, c_hash) per OIDC Core §3.1.3.6.
+ * Hashes the token, takes the left half, and base64url-encodes it.
+ */
+async function computeOidcHash(
+	token: string,
+	signingAlg: string,
+): Promise<string> {
+	let hashAlg: string;
+	if (signingAlg === "EdDSA") {
+		hashAlg = "SHA-512";
+	} else if (signingAlg.endsWith("384")) {
+		hashAlg = "SHA-384";
+	} else if (signingAlg.endsWith("512")) {
+		hashAlg = "SHA-512";
+	} else {
+		hashAlg = "SHA-256";
+	}
+
+	const digest = new Uint8Array(
+		await crypto.subtle.digest(hashAlg, new TextEncoder().encode(token)),
+	);
+	return base64url.encode(digest.slice(0, digest.length / 2));
 }
 
 /**
@@ -132,6 +185,7 @@ async function createIdToken(
 	nonce?: string,
 	sessionId?: string,
 	authTime?: Date,
+	accessToken?: string,
 ) {
 	const iat = Math.floor(Date.now() / 1000);
 	const exp = iat + (opts.idTokenExpiresIn ?? 36000);
@@ -156,18 +210,36 @@ async function createIdToken(
 		? undefined
 		: getJwtPlugin(ctx.context).options;
 
+	// Resolve the signing key once: used for both at_hash and signing
+	const resolvedKey =
+		!opts.disableJwtPlugin && !jwtPluginOptions?.jwt?.sign
+			? await resolveSigningKey(ctx, jwtPluginOptions)
+			: undefined;
+
+	// For custom signer, alg is guaranteed set by JWT plugin init validation
+	const signingAlg = opts.disableJwtPlugin
+		? "HS256"
+		: (resolvedKey?.alg ?? jwtPluginOptions?.jwks?.keyPairConfig?.alg!);
+	const atHash = accessToken
+		? await computeOidcHash(accessToken, signingAlg)
+		: undefined;
+
+	const emitSid = Boolean(
+		client.enableEndSession || client.backchannelLogoutUri,
+	);
 	const payload: JWTPayload = {
 		...userClaims,
 		auth_time: authTimeSec,
 		acr,
 		...customClaims,
+		at_hash: atHash,
 		iss: jwtPluginOptions?.jwt?.issuer ?? ctx.context.baseURL,
 		sub: resolvedSub,
 		aud: client.clientId,
 		nonce,
 		iat,
 		exp,
-		sid: client.enableEndSession ? sessionId : undefined,
+		sid: emitSid ? sessionId : undefined,
 	};
 
 	// Public clients without a client secret cannot receive an idToken as it can't be verified
@@ -176,8 +248,8 @@ async function createIdToken(
 		return undefined;
 	}
 
-	return opts.disableJwtPlugin
-		? new SignJWT(payload)
+	const idToken = opts.disableJwtPlugin
+		? await new SignJWT(payload)
 				.setProtectedHeader({ alg: "HS256" })
 				.sign(
 					new TextEncoder().encode(
@@ -188,10 +260,28 @@ async function createIdToken(
 						),
 					),
 				)
-		: signJWT(ctx, {
+		: await signJWT(ctx, {
 				options: jwtPluginOptions,
 				payload,
+				resolvedKey: resolvedKey ?? undefined,
 			});
+
+	// When using a custom jwt.sign callback, validate that the actual
+	// signing algorithm matches what was used for at_hash (OIDC Core §3.1.3.6)
+	if (idToken && atHash && jwtPluginOptions?.jwt?.sign) {
+		const header = decodeProtectedHeader(idToken);
+		if (header.alg !== signingAlg) {
+			throw new APIError("INTERNAL_SERVER_ERROR", {
+				error_description:
+					`ID token signed with "${header.alg}" but at_hash was computed ` +
+					`for "${signingAlg}". Ensure jwt.sign uses the algorithm ` +
+					`declared in keyPairConfig.alg.`,
+				error: "server_error",
+			});
+		}
+	}
+
+	return idToken;
 }
 
 /**
@@ -242,6 +332,7 @@ async function createOpaqueAccessToken(
 	client: SchemaClient<Scope[]>,
 	scopes: string[],
 	payload: JWTPayload,
+	resources?: string[],
 	referenceId?: string,
 	refreshId?: string,
 ) {
@@ -258,6 +349,7 @@ async function createOpaqueAccessToken(
 			sessionId: payload?.sid,
 			userId: user?.id,
 			referenceId,
+			resources,
 			refreshId,
 			scopes,
 			createdAt: new Date(iat * 1000),
@@ -327,6 +419,7 @@ async function createRefreshToken(
 	payload: JWTPayload,
 	originalRefresh?: OAuthRefreshToken<Scope[]> & { id: string },
 	authTime?: Date,
+	resources?: string[],
 ) {
 	const iat = payload.iat ?? Math.floor(Date.now() / 1000);
 	const exp = payload?.exp ?? iat + (opts.refreshTokenExpiresIn ?? 2592000);
@@ -347,6 +440,7 @@ async function createRefreshToken(
 		referenceId,
 		authTime,
 		scopes,
+		resources,
 		createdAt: new Date(iat * 1000),
 		expiresAt: new Date(exp * 1000),
 	};
@@ -412,50 +506,6 @@ async function createRefreshToken(
 	};
 }
 
-/**
- * Checks the resource parameter, if provided,
- * and returns a valid audience based on the request
- */
-async function checkResource(
-	ctx: GenericEndpointContext,
-	opts: OAuthOptions<Scope[]>,
-	scopes: string[],
-) {
-	const resource: string | string[] | undefined = ctx.body.resource;
-	const audience =
-		typeof resource === "string"
-			? [resource]
-			: resource
-				? [...resource]
-				: undefined;
-	if (audience) {
-		// Adds /userinfo to audience
-		if (scopes.includes("openid")) {
-			audience.push(`${ctx.context.baseURL}/oauth2/userinfo`);
-		}
-		// Check valid audiences
-		const validAudiences = new Set(
-			[
-				...(opts.validAudiences ?? [ctx.context.baseURL]),
-				scopes?.includes("openid")
-					? `${ctx.context.baseURL}/oauth2/userinfo`
-					: undefined,
-			]
-				.flat()
-				.filter((v) => v?.length),
-		);
-		for (const aud of audience) {
-			if (!validAudiences.has(aud)) {
-				throw new APIError("BAD_REQUEST", {
-					error_description: "requested resource invalid",
-					error: "invalid_request",
-				});
-			}
-		}
-	}
-	return audience?.length === 1 ? audience.at(0) : audience;
-}
-
 interface CreateUserTokensParams {
 	client: SchemaClient<Scope[]>;
 	scopes: string[];
@@ -467,6 +517,67 @@ interface CreateUserTokensParams {
 	refreshToken?: OAuthRefreshToken<Scope[]> & { id: string };
 	authTime?: Date;
 	verificationValue?: VerificationValue;
+	resources?: string[];
+	/** Full original authorized resources for the grant, used to seed the refresh token
+	 * when the token request narrows the resource (RFC 8707 §2.2). */
+	originalResources?: string[];
+}
+
+interface ResourceGrantIssuance {
+	audienceClaim: ResolvedResourcePolicy["audienceClaim"];
+	effectiveScopes: string[];
+	accessTokenExpiresAtSeconds: number;
+	refreshTokenExpiresAtSeconds: number;
+	refreshResources?: string[];
+	signingAlgorithm: ResolvedResourcePolicy["signingAlgorithm"];
+	signingKeyId: ResolvedResourcePolicy["signingKeyId"];
+	resourceCustomClaims: Record<string, unknown>;
+}
+
+async function resolveResourceGrantIssuance(
+	ctx: GenericEndpointContext,
+	opts: OAuthOptions<Scope[]>,
+	params: {
+		clientId: string;
+		requestedScopes: string[];
+		resources?: string[];
+		originalResources?: string[];
+		refreshToken?: OAuthRefreshToken<Scope[]> & { id: string };
+		iat: number;
+		scopeExpiresAtSeconds: number;
+	},
+): Promise<ResourceGrantIssuance> {
+	const resourcePolicy = await resolveResourcePolicy(ctx, opts, {
+		resource: params.resources,
+		clientId: params.clientId,
+		requestedScopes: params.requestedScopes,
+	});
+	const resourceExpiresAtSeconds =
+		resourcePolicy.accessTokenTtl !== null
+			? params.iat + resourcePolicy.accessTokenTtl
+			: params.scopeExpiresAtSeconds;
+	const refreshTokenDefaultTtl = opts.refreshTokenExpiresIn ?? 2592000;
+	const refreshTokenTtl =
+		resourcePolicy.refreshTokenTtl !== null
+			? Math.min(resourcePolicy.refreshTokenTtl, refreshTokenDefaultTtl)
+			: refreshTokenDefaultTtl;
+
+	return {
+		audienceClaim: resourcePolicy.audienceClaim,
+		effectiveScopes: resourcePolicy.effectiveScopes,
+		accessTokenExpiresAtSeconds: Math.min(
+			params.scopeExpiresAtSeconds,
+			resourceExpiresAtSeconds,
+		),
+		refreshTokenExpiresAtSeconds: params.iat + refreshTokenTtl,
+		refreshResources:
+			params.refreshToken?.resources ??
+			params.originalResources ??
+			params.resources,
+		signingAlgorithm: resourcePolicy.signingAlgorithm,
+		signingKeyId: resourcePolicy.signingKeyId,
+		resourceCustomClaims: resourcePolicy.customClaims,
+	};
 }
 
 async function createUserTokens(
@@ -492,7 +603,7 @@ async function createUserTokens(
 		? (opts.accessTokenExpiresIn ?? 3600)
 		: (opts.m2mAccessTokenExpiresIn ?? 3600);
 	const defaultExp = iat + baseExpiry;
-	const exp = opts.scopeExpirations
+	const scopeExp = opts.scopeExpirations
 		? scopes
 				.map((sc) =>
 					opts.scopeExpirations?.[sc]
@@ -504,13 +615,28 @@ async function createUserTokens(
 				}, defaultExp)
 		: defaultExp;
 
-	// Check requested audience if sent as the resource parameter
-	const audience = await checkResource(ctx, opts, scopes);
+	const grantIssuance = await resolveResourceGrantIssuance(ctx, opts, {
+		clientId: client.clientId,
+		requestedScopes: scopes,
+		resources: params.resources,
+		originalResources: params.originalResources,
+		refreshToken: params.refreshToken,
+		iat,
+		scopeExpiresAtSeconds: scopeExp,
+	});
+	const audienceClaim = grantIssuance.audienceClaim;
+	const effectiveScopes = grantIssuance.effectiveScopes;
+	const exp = grantIssuance.accessTokenExpiresAtSeconds;
+	const refreshTokenExp = grantIssuance.refreshTokenExpiresAtSeconds;
+	// Only mint a refresh token when the client may use refresh tokens.
+	// Otherwise an `offline_access` scope alone would hand a refresh token to a
+	// pure machine-to-machine client that was never authorized for one.
 	const isRefreshToken =
 		user &&
+		clientAllowsGrant(client, "refresh_token") &&
 		(existingRefreshToken?.scopes?.includes("offline_access") ||
 			scopes.includes("offline_access"));
-	const isJwtAccessToken = audience && !opts.disableJwtPlugin;
+	const isJwtAccessToken = audienceClaim && !opts.disableJwtPlugin;
 	const isIdToken = user && scopes.includes("openid");
 
 	// Resolve custom fields before any token side effects (refresh rotation, DB writes)
@@ -518,11 +644,13 @@ async function createUserTokens(
 		? await opts.customTokenResponseFields({
 				grantType,
 				user,
-				scopes,
+				scopes: effectiveScopes,
 				metadata: parseClientMetadata(client.metadata),
 				verificationValue,
 			})
 		: undefined;
+
+	const refreshResources = grantIssuance.refreshResources;
 
 	// Refresh token may need to be created beforehand for id field
 	const earlyRefreshToken =
@@ -533,32 +661,37 @@ async function createUserTokens(
 					user,
 					referenceId,
 					client,
-					scopes,
+					effectiveScopes,
 					{
 						iat,
-						exp: iat + (opts.refreshTokenExpiresIn ?? 2592000),
+						exp: refreshTokenExp,
 						sid: sessionId,
 					},
 					existingRefreshToken,
 					authTime,
+					refreshResources,
 				)
 			: undefined;
 
-	// Sign jwt and refresh tokens in parallel
-	const [accessToken, refreshToken, idToken] = await Promise.all([
+	// Create access token and refresh token in parallel
+	const [accessToken, refreshToken] = await Promise.all([
 		isJwtAccessToken
 			? createJwtAccessToken(
 					ctx,
 					opts,
 					user,
 					client,
-					audience,
-					scopes,
+					audienceClaim,
+					effectiveScopes,
+					params?.resources,
 					referenceId,
 					{
 						iat,
 						exp,
 						sid: sessionId,
+						signingAlgorithm: grantIssuance.signingAlgorithm,
+						signingKeyId: grantIssuance.signingKeyId,
+						resourceCustomClaims: grantIssuance.resourceCustomClaims,
 					},
 				)
 			: createOpaqueAccessToken(
@@ -566,12 +699,13 @@ async function createUserTokens(
 					opts,
 					user,
 					client,
-					scopes,
+					effectiveScopes,
 					{
 						iat,
 						exp,
 						sid: sessionId,
 					},
+					params?.resources,
 					referenceId,
 					earlyRefreshToken?.id,
 				),
@@ -584,29 +718,33 @@ async function createUserTokens(
 						user,
 						referenceId,
 						client,
-						scopes,
+						effectiveScopes,
 						{
 							iat,
-							exp: iat + (opts.refreshTokenExpiresIn ?? 2592000),
+							exp: refreshTokenExp,
 							sid: sessionId,
 						},
 						existingRefreshToken,
 						authTime,
+						refreshResources,
 					)
 				: undefined,
-		isIdToken && user
-			? createIdToken(
-					ctx,
-					opts,
-					user,
-					client,
-					scopes,
-					nonce,
-					sessionId,
-					authTime,
-				)
-			: undefined,
 	]);
+
+	// ID token created after access token so at_hash can be computed
+	const idToken = isIdToken
+		? await createIdToken(
+				ctx,
+				opts,
+				user,
+				client,
+				scopes,
+				nonce,
+				sessionId,
+				authTime,
+				accessToken,
+			)
+		: undefined;
 
 	return ctx.json(
 		{
@@ -616,7 +754,7 @@ async function createUserTokens(
 			expires_at: exp,
 			token_type: "Bearer" as const,
 			refresh_token: refreshToken?.token,
-			scope: scopes.join(" "),
+			scope: effectiveScopes.join(" "),
 			id_token: idToken,
 		},
 		{
@@ -635,6 +773,7 @@ async function checkVerificationValue(
 	code: string,
 	client_id: string,
 	redirect_uri?: string,
+	resource?: string[],
 ) {
 	// Atomic single-use redemption per RFC 6749 §4.1.2. The first caller
 	// receives the row and mints tokens; concurrent racers receive `null`
@@ -646,14 +785,7 @@ async function checkVerificationValue(
 
 	if (!verification) {
 		throw new APIError("UNAUTHORIZED", {
-			error_description: "Invalid code",
-			error: "invalid_grant",
-		});
-	}
-
-	if (!verification.expiresAt || verification.expiresAt < new Date()) {
-		throw new APIError("UNAUTHORIZED", {
-			error_description: "code expired",
+			error_description: "invalid code",
 			error: "invalid_grant",
 		});
 	}
@@ -692,8 +824,30 @@ async function checkVerificationValue(
 			error: "invalid_request",
 		});
 	}
+	// Prefer the new top-level field, but keep compatibility with legacy values in query.resource.
+	const storedResources =
+		toResourceList(verificationValue.resource) ??
+		toResourceList(verificationValue.query.resource);
+	const effectiveResources = resource ?? storedResources;
 
-	return verificationValue;
+	if (resource && storedResources) {
+		const requestedSet = new Set(resource);
+		const authorizedSet = new Set(storedResources);
+		for (const r of requestedSet) {
+			if (!authorizedSet.has(r)) {
+				throw new APIError("BAD_REQUEST", {
+					error_description: "requested resource not authorized",
+					error: "invalid_target",
+				});
+			}
+		}
+	}
+
+	return {
+		verificationValue,
+		effectiveResources,
+		authorizedResources: storedResources,
+	};
 }
 
 /**
@@ -703,27 +857,29 @@ async function handleAuthorizationCodeGrant(
 	ctx: GenericEndpointContext,
 	opts: OAuthOptions<Scope[]>,
 ) {
-	let {
-		client_id,
-		client_secret,
+	const credentials = await extractClientCredentials(
+		ctx,
+		opts,
+		`${ctx.context.baseURL}/oauth2/token`,
+	);
+	const {
+		clientId: client_id,
+		clientSecret: client_secret,
+		preVerifiedClient,
+	} = destructureCredentials(credentials);
+
+	const {
 		code,
 		code_verifier,
 		redirect_uri,
+		resource,
 	}: {
-		client_id?: string;
-		client_secret?: string;
 		code?: string;
 		code_verifier?: string;
 		redirect_uri?: string;
+		resource?: string | string[];
 	} = ctx.body;
-	const authorization = ctx.request?.headers.get("authorization") || null;
-
-	// Convert basic authorization
-	if (authorization?.startsWith("Basic ")) {
-		const res = basicToClientCredentials(authorization);
-		client_id = res?.client_id;
-		client_secret = res?.client_secret;
-	}
+	const resources = toResourceList(resource);
 
 	if (!client_id) {
 		throw new APIError("BAD_REQUEST", {
@@ -747,7 +903,7 @@ async function handleAuthorizationCodeGrant(
 	const isAuthCodeWithSecret = client_id && client_secret;
 	const isAuthCodeWithPkce = client_id && code && code_verifier;
 
-	if (!isAuthCodeWithSecret && !isAuthCodeWithPkce) {
+	if (!isAuthCodeWithSecret && !isAuthCodeWithPkce && !preVerifiedClient) {
 		throw new APIError("BAD_REQUEST", {
 			error_description: "Either code_verifier or client_secret is required",
 			error: "invalid_request",
@@ -755,13 +911,15 @@ async function handleAuthorizationCodeGrant(
 	}
 
 	/** Get and check Verification Value */
-	const verificationValue = await checkVerificationValue(
-		ctx,
-		opts,
-		code,
-		client_id,
-		redirect_uri,
-	);
+	const { verificationValue, effectiveResources, authorizedResources } =
+		await checkVerificationValue(
+			ctx,
+			opts,
+			code,
+			client_id,
+			redirect_uri,
+			resources,
+		);
 	const scopes = verificationValue.query.scope?.split(" ");
 	if (!scopes) {
 		throw new APIError("INTERNAL_SERVER_ERROR", {
@@ -777,6 +935,8 @@ async function handleAuthorizationCodeGrant(
 		client_id,
 		client_secret,
 		scopes,
+		preVerifiedClient,
+		"authorization_code",
 	);
 
 	// Parse scopes from the authorization request
@@ -796,11 +956,11 @@ async function handleAuthorizationCodeGrant(
 			});
 		}
 	} else {
-		// PKCE is optional - must have either PKCE or client_secret
-		if (!(isAuthCodeWithPkce || isAuthCodeWithSecret)) {
+		// PKCE is optional - must have either PKCE, client_secret, or client_assertion
+		if (!(isAuthCodeWithPkce || isAuthCodeWithSecret || preVerifiedClient)) {
 			throw new APIError("BAD_REQUEST", {
 				error_description:
-					"Either PKCE (code_verifier) or client authentication (client_secret) is required",
+					"Either PKCE (code_verifier) or client authentication (client_secret or client_assertion) is required",
 				error: "invalid_request",
 			});
 		}
@@ -894,6 +1054,8 @@ async function handleAuthorizationCodeGrant(
 		nonce: verificationValue.query?.nonce,
 		authTime,
 		verificationValue,
+		resources: effectiveResources,
+		originalResources: authorizedResources,
 	});
 }
 
@@ -907,23 +1069,19 @@ async function handleClientCredentialsGrant(
 	ctx: GenericEndpointContext,
 	opts: OAuthOptions<Scope[]>,
 ) {
-	let {
-		client_id,
-		client_secret,
-		scope,
-	}: {
-		client_id?: string;
-		client_secret?: string;
-		scope?: string;
-	} = ctx.body;
-	const authorization = ctx.request?.headers.get("authorization") || null;
-
-	// Convert basic authorization
-	if (authorization?.startsWith("Basic ")) {
-		const res = basicToClientCredentials(authorization);
-		client_id = res?.client_id;
-		client_secret = res?.client_secret;
-	}
+	const credentials = await extractClientCredentials(
+		ctx,
+		opts,
+		`${ctx.context.baseURL}/oauth2/token`,
+	);
+	const {
+		clientId: client_id,
+		clientSecret: client_secret,
+		preVerifiedClient,
+	} = destructureCredentials(credentials);
+	const { scope, resource }: { scope?: string; resource?: string | string[] } =
+		ctx.body;
+	const resources = toResourceList(resource);
 
 	if (!client_id) {
 		throw new APIError("BAD_REQUEST", {
@@ -931,7 +1089,7 @@ async function handleClientCredentialsGrant(
 			error: "invalid_grant",
 		});
 	}
-	if (!client_secret) {
+	if (!client_secret && !preVerifiedClient) {
 		throw new APIError("BAD_REQUEST", {
 			error_description: "Missing a required client_secret",
 			error: "invalid_grant",
@@ -944,6 +1102,9 @@ async function handleClientCredentialsGrant(
 		opts,
 		client_id,
 		client_secret,
+		undefined,
+		preVerifiedClient,
+		"client_credentials",
 	);
 
 	// OIDC scopes should not be requestable (code authorization grant should be used)
@@ -979,6 +1140,7 @@ async function handleClientCredentialsGrant(
 		client,
 		scopes: requestedScopes,
 		grantType: "client_credentials",
+		resources,
 	});
 }
 
@@ -992,26 +1154,27 @@ async function handleRefreshTokenGrant(
 	ctx: GenericEndpointContext,
 	opts: OAuthOptions<Scope[]>,
 ) {
-	let {
-		client_id,
-		client_secret,
+	const credentials = await extractClientCredentials(
+		ctx,
+		opts,
+		`${ctx.context.baseURL}/oauth2/token`,
+	);
+	const {
+		clientId: client_id,
+		clientSecret: client_secret,
+		preVerifiedClient,
+	} = destructureCredentials(credentials);
+
+	const {
 		refresh_token,
 		scope,
+		resource,
 	}: {
-		client_id?: string;
-		client_secret?: string;
 		refresh_token?: string;
 		scope?: string;
+		resource?: string | string[];
 	} = ctx.body;
-
-	const authorization = ctx.request?.headers.get("authorization") || null;
-
-	// Convert basic authorization
-	if (authorization?.startsWith("Basic ")) {
-		const res = basicToClientCredentials(authorization);
-		client_id = res?.client_id;
-		client_secret = res?.client_secret;
-	}
+	const resources = toResourceList(resource);
 
 	if (!client_id) {
 		throw new APIError("BAD_REQUEST", {
@@ -1073,6 +1236,18 @@ async function handleRefreshTokenGrant(
 		});
 	}
 
+	// Check body resources against refresh token resources
+	if (
+		resources &&
+		refreshToken.resources &&
+		!resources.every((v) => refreshToken.resources?.includes(v))
+	) {
+		throw new APIError("BAD_REQUEST", {
+			error_description: "requested resource invalid",
+			error: "invalid_target",
+		});
+	}
+
 	// Check session scopes
 	const scopes = refreshToken?.scopes;
 	const requestedScopes = scope?.split(" ");
@@ -1094,6 +1269,8 @@ async function handleRefreshTokenGrant(
 		client_id,
 		client_secret, // Optional for refresh_grant but required on confidential clients
 		requestedScopes ?? scopes,
+		preVerifiedClient,
+		"refresh_token",
 	);
 
 	const user = await ctx.context.internalAdapter.findUserById(
@@ -1120,6 +1297,7 @@ async function handleRefreshTokenGrant(
 		referenceId: refreshToken.referenceId,
 		sessionId: refreshToken.sessionId,
 		refreshToken,
+		resources: resources ?? refreshToken.resources,
 		authTime,
 	});
 }
